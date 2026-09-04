@@ -68,10 +68,12 @@
 .diff-side.is-active { display: grid; }
 .diff-side-col { padding: var(--space-5); overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
 .diff-side-col:first-child { border-right: 1px solid var(--border); }
-.side-row { display: block; padding: 1px 6px; border-radius: 4px; min-height: 1.7em; }
+.side-row { display: flex; align-items: flex-start; gap: var(--space-3); padding: 1px 6px; border-radius: 4px; min-height: 1.7em; }
 .side-row.--add { background: var(--success-soft); }
 .side-row.--del { background: var(--danger-soft); }
 .side-row.--empty { opacity: .35; }
+.side-num { flex: none; width: 2.75em; text-align: right; color: var(--text-muted); user-select: none; }
+.side-text { flex: 1; min-width: 0; }
 
 /* ===================== Empty / too-large states ===================== */
 .empty { text-align: center; color: var(--text-muted); padding: var(--space-10) var(--space-4); }

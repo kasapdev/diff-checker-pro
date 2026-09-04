@@ -41,12 +41,13 @@ Then simply open `index.html` in any modern browser (double-click it, or `file:/
 
 ## Keyboard Shortcuts
 
-| Action               | Shortcut                       |
-| -------------------- | ------------------------------ |
-| Copy diff             | <kbd>Ctrl/⌘</kbd> + <kbd>Enter</kbd> |
-| Download diff          | <kbd>Ctrl/⌘</kbd> + <kbd>S</kbd> |
-| Show shortcuts help  | <kbd>?</kbd>                    |
-| Close dialog          | <kbd>Esc</kbd>                  |
+| Action                | Shortcut                              |
+| --------------------- | -------------------------------------- |
+| Re-diff now            | <kbd>Ctrl/⌘</kbd> + <kbd>Enter</kbd> |
+| Download diff           | <kbd>Ctrl/⌘</kbd> + <kbd>S</kbd> |
+| Swap Text A / Text B    | <kbd>Ctrl/⌘</kbd> + <kbd>Shift</kbd> + <kbd>X</kbd> |
+| Show shortcuts help   | <kbd>?</kbd>                    |
+| Close dialog           | <kbd>Esc</kbd>                  |
 
 ## Screenshots
 

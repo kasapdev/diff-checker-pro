@@ -1,378 +1,462 @@
 /* =====================================================================
    Diff Checker Pro — app.js
-   Line/word diff with unified and side-by-side views, powered by a
-   self-written LCS diff. Classic script (no modules). Depends on WUS.
+   Hand-written LCS (longest common subsequence) diff engine — line-level
+   and word-level — with side-by-side and unified rendering.
+   Classic script (no modules). Depends on window.WUS (core.js).
    ===================================================================== */
 (function () {
   'use strict';
 
   var WUS = window.WUS;
   var STORE_KEY = 'diffchecker.state';
-  var MAX_CELLS = 2000000; // guard against pathological LCS table sizes
+
+  /* Guard against pathological O(n*m) blowups: cap the DP table size. */
+  var LINE_CAP = 2000 * 2000;   /* ~4,000,000 cells for the line-level pass  */
+  var WORD_CAP = 400 * 400;     /* per changed-line-pair word-level pass     */
 
   /* ----------------------------- DOM refs ---------------------------- */
-  var inputA = document.getElementById('inputA');
-  var inputB = document.getElementById('inputB');
-  var statsA = document.getElementById('statsA');
-  var statsB = document.getElementById('statsB');
-
-  var statusBadge = document.getElementById('statusBadge');
-  var statusText  = document.getElementById('statusText');
+  var inputA  = document.getElementById('inputA');
+  var inputB  = document.getElementById('inputB');
+  var statsA  = document.getElementById('statsA');
+  var statsB  = document.getElementById('statsB');
 
   var modeLineBtn = document.getElementById('modeLine');
   var modeWordBtn = document.getElementById('modeWord');
   var viewUnifiedBtn = document.getElementById('viewUnified');
   var viewSideBtn = document.getElementById('viewSide');
 
-  var summaryBar = document.getElementById('summaryBar');
-  var statAdded = document.getElementById('statAdded');
-  var statRemoved = document.getElementById('statRemoved');
-  var statChanged = document.getElementById('statChanged');
+  var btnSwap     = document.getElementById('btnSwap');
+  var btnCopy     = document.getElementById('btnCopy');
+  var btnDownload = document.getElementById('btnDownload');
+  var btnSample   = document.getElementById('btnSample');
+  var btnClear    = document.getElementById('btnClear');
+  var btnSampleEmpty = document.getElementById('btnSampleEmpty');
+
+  var statusBadge = document.getElementById('statusBadge');
+  var statusText  = document.getElementById('statusText');
+
+  var summaryBar    = document.getElementById('summaryBar');
+  var statAdded     = document.getElementById('statAdded');
+  var statRemoved   = document.getElementById('statRemoved');
+  var statChanged   = document.getElementById('statChanged');
   var statUnchanged = document.getElementById('statUnchanged');
 
-  var diffMeta = document.getElementById('diffMeta');
-  var diffScroll = document.getElementById('diffScroll');
+  var diffMeta    = document.getElementById('diffMeta');
   var diffUnified = document.getElementById('diffUnified');
-  var diffSide = document.getElementById('diffSide');
-  var diffSideA = document.getElementById('diffSideA');
-  var diffSideB = document.getElementById('diffSideB');
-  var emptyState = document.getElementById('emptyState');
-  var tooLarge = document.getElementById('tooLarge');
+  var diffSide    = document.getElementById('diffSide');
+  var diffSideA   = document.getElementById('diffSideA');
+  var diffSideB   = document.getElementById('diffSideB');
+  var emptyState  = document.getElementById('emptyState');
+  var tooLarge    = document.getElementById('tooLarge');
 
-  var mode = 'line'; // 'line' | 'word'
-  var view = 'unified'; // 'unified' | 'side'
-  var lastOps = null; // cached diff ops for the current mode
-  var lastTooLarge = false;
+  /* ------------------------------ State ------------------------------ */
+  var granularity = 'line'; /* 'line' | 'word' */
+  var view = 'unified';     /* 'unified' | 'side' */
 
-  /* =================================================================
-     TOKENIZERS
-     ================================================================= */
-  function tokenizeLine(text) {
-    if (text === '') return [];
-    return text.split('\n');
-  }
-  function tokenizeWord(text) {
-    if (text === '') return [];
-    return text.split(/(\s+)/).filter(function (t) { return t.length > 0; });
-  }
-  function tokenize(text, m) {
-    return m === 'word' ? tokenizeWord(text) : tokenizeLine(text);
-  }
+  /* The most recently rendered unified plain-text diff (for copy/download). */
+  var lastUnifiedText = '';
 
   /* =================================================================
-     LCS DIFF — returns an ordered list of {type: 'equal'|'add'|'del', value}
-     or null if the input is too large for a live diff.
+     LCS DIFF ENGINE
+     Classic dynamic-programming LCS over two arrays (lines OR word
+     tokens), walked back into a flat list of equal/add/del ops.
+     Returns null when the DP table would exceed `cap` cells — callers
+     fall back to a simpler message rather than blocking the browser
+     on a huge O(n*m) table.
      ================================================================= */
-  function diffArrays(a, b) {
+  function computeLCSOps(a, b, cap) {
     var n = a.length, m = b.length;
-    if ((n + 1) * (m + 1) > MAX_CELLS) return null;
+    if ((n + 1) * (m + 1) > cap) return null;
 
-    var w = m + 1;
-    var dp = new Int32Array((n + 1) * w);
+    if (n === 0) {
+      var onlyAdds = [];
+      for (var jj = 0; jj < m; jj++) onlyAdds.push({ type: 'add', b: b[jj], bi: jj });
+      return onlyAdds;
+    }
+    if (m === 0) {
+      var onlyDels = [];
+      for (var ii = 0; ii < n; ii++) onlyDels.push({ type: 'del', a: a[ii], ai: ii });
+      return onlyDels;
+    }
 
-    for (var i = n - 1; i >= 0; i--) {
+    /* dp[i][j] = length of the LCS of a[i:] and b[j:] */
+    var dp = new Array(n + 1);
+    for (var i = 0; i <= n; i++) dp[i] = new Int32Array(m + 1);
+
+    for (i = n - 1; i >= 0; i--) {
+      var rowI = dp[i], rowI1 = dp[i + 1];
       for (var j = m - 1; j >= 0; j--) {
-        if (a[i] === b[j]) {
-          dp[i * w + j] = dp[(i + 1) * w + (j + 1)] + 1;
-        } else {
-          var up = dp[(i + 1) * w + j];
-          var left = dp[i * w + (j + 1)];
-          dp[i * w + j] = up >= left ? up : left;
-        }
+        if (a[i] === b[j]) rowI[j] = rowI1[j + 1] + 1;
+        else rowI[j] = rowI1[j] >= rowI[j + 1] ? rowI1[j] : rowI[j + 1];
       }
     }
 
+    /* Walk forward, at each step preferring "equal" then the branch
+       the DP table says still holds the longer subsequence. */
     var ops = [];
-    var i = 0, j = 0;
+    i = 0;
+    var j = 0;
     while (i < n && j < m) {
       if (a[i] === b[j]) {
-        ops.push({ type: 'equal', value: a[i] });
+        ops.push({ type: 'equal', a: a[i], b: b[j], ai: i, bi: j });
         i++; j++;
-      } else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) {
-        ops.push({ type: 'del', value: a[i] });
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        ops.push({ type: 'del', a: a[i], ai: i });
         i++;
       } else {
-        ops.push({ type: 'add', value: b[j] });
+        ops.push({ type: 'add', b: b[j], bi: j });
         j++;
       }
     }
-    while (i < n) { ops.push({ type: 'del', value: a[i] }); i++; }
-    while (j < m) { ops.push({ type: 'add', value: b[j] }); j++; }
+    while (i < n) { ops.push({ type: 'del', a: a[i], ai: i }); i++; }
+    while (j < m) { ops.push({ type: 'add', b: b[j], bi: j }); j++; }
     return ops;
   }
 
-  function mergeConsecutive(ops) {
+  /* =================================================================
+     ROW GROUPING
+     Turn the flat op list into display rows, pairing up an adjacent
+     run of deletions with a run of additions into "changed" rows —
+     the classic heuristic: same-position del/add pairs inside one
+     contiguous non-equal block read as a modification, not a swap.
+     ================================================================= */
+  function buildRows(ops) {
+    var rows = [];
+    var i = 0;
+    while (i < ops.length) {
+      if (ops[i].type === 'equal') {
+        rows.push({ type: 'equal', a: ops[i].a, b: ops[i].b, ai: ops[i].ai, bi: ops[i].bi });
+        i++;
+        continue;
+      }
+      var dels = [], adds = [];
+      var j = i;
+      while (j < ops.length && ops[j].type !== 'equal') {
+        if (ops[j].type === 'del') dels.push(ops[j]); else adds.push(ops[j]);
+        j++;
+      }
+      var pairCount = Math.min(dels.length, adds.length);
+      for (var k = 0; k < pairCount; k++) {
+        rows.push({ type: 'changed', a: dels[k].a, b: adds[k].b, ai: dels[k].ai, bi: adds[k].bi });
+      }
+      for (var k1 = pairCount; k1 < dels.length; k1++) {
+        rows.push({ type: 'del', a: dels[k1].a, ai: dels[k1].ai });
+      }
+      for (var k2 = pairCount; k2 < adds.length; k2++) {
+        rows.push({ type: 'add', b: adds[k2].b, bi: adds[k2].bi });
+      }
+      i = j;
+    }
+    return rows;
+  }
+
+  function countRows(rows) {
+    var c = { added: 0, removed: 0, changed: 0, unchanged: 0 };
+    rows.forEach(function (r) {
+      if (r.type === 'add') c.added++;
+      else if (r.type === 'del') c.removed++;
+      else if (r.type === 'changed') c.changed++;
+      else c.unchanged++;
+    });
+    return c;
+  }
+
+  /* =================================================================
+     WORD-LEVEL DIFF (nested within a single changed line pair)
+     ================================================================= */
+  function tokenizeWords(line) {
+    if (line === '') return [];
+    var parts = line.split(/(\s+)/);
     var out = [];
-    for (var k = 0; k < ops.length; k++) {
-      var op = ops[k];
-      var prev = out[out.length - 1];
-      if (prev && prev.type === op.type) prev.value += op.value;
-      else out.push({ type: op.type, value: op.value });
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] !== '') out.push(parts[i]);
     }
     return out;
+  }
+
+  function wordDiffHtml(aText, bText) {
+    var aTokens = tokenizeWords(aText);
+    var bTokens = tokenizeWords(bText);
+    var ops = computeLCSOps(aTokens, bTokens, WORD_CAP);
+    if (!ops) {
+      /* Pathological line (e.g. one huge minified line) — skip word
+         highlighting for this pair and just show the whole lines. */
+      return { aHtml: WUS.escapeHtml(aText), bHtml: WUS.escapeHtml(bText) };
+    }
+    var aHtml = '', bHtml = '';
+    ops.forEach(function (op) {
+      if (op.type === 'equal') {
+        aHtml += WUS.escapeHtml(op.a);
+        bHtml += WUS.escapeHtml(op.b);
+      } else if (op.type === 'del') {
+        aHtml += '<span class="tok-del">' + WUS.escapeHtml(op.a) + '</span>';
+      } else {
+        bHtml += '<span class="tok-add">' + WUS.escapeHtml(op.b) + '</span>';
+      }
+    });
+    return { aHtml: aHtml, bHtml: bHtml };
   }
 
   /* =================================================================
      RENDERERS
      ================================================================= */
-  function renderUnifiedLine(ops) {
+  function renderUnified(rows) {
     var html = '';
-    for (var k = 0; k < ops.length; k++) {
-      var op = ops[k];
-      var marker = op.type === 'add' ? '+' : op.type === 'del' ? '-' : ' ';
-      var cls = op.type === 'add' ? ' --add' : op.type === 'del' ? ' --del' : '';
-      html += '<span class="diff-line' + cls + '"><span class="diff-marker">' + marker + '</span>' +
-        WUS.escapeHtml(op.value) + '</span>\n';
-    }
-    return html;
+    var text = '';
+    rows.forEach(function (row) {
+      if (row.type === 'equal') {
+        html += '<span class="diff-line"><span class="diff-marker">&nbsp;</span>' + WUS.escapeHtml(row.a) + '</span>\n';
+        text += '  ' + row.a + '\n';
+      } else if (row.type === 'del') {
+        html += '<span class="diff-line --del"><span class="diff-marker">-</span>' + WUS.escapeHtml(row.a) + '</span>\n';
+        text += '- ' + row.a + '\n';
+      } else if (row.type === 'add') {
+        html += '<span class="diff-line --add"><span class="diff-marker">+</span>' + WUS.escapeHtml(row.b) + '</span>\n';
+        text += '+ ' + row.b + '\n';
+      } else { /* changed */
+        if (granularity === 'word') {
+          var wd = wordDiffHtml(row.a, row.b);
+          html += '<span class="diff-line --del"><span class="diff-marker">-</span>' + wd.aHtml + '</span>\n';
+          html += '<span class="diff-line --add"><span class="diff-marker">+</span>' + wd.bHtml + '</span>\n';
+        } else {
+          html += '<span class="diff-line --del"><span class="diff-marker">-</span>' + WUS.escapeHtml(row.a) + '</span>\n';
+          html += '<span class="diff-line --add"><span class="diff-marker">+</span>' + WUS.escapeHtml(row.b) + '</span>\n';
+        }
+        text += '- ' + row.a + '\n' + '+ ' + row.b + '\n';
+      }
+    });
+    diffUnified.innerHTML = html;
+    lastUnifiedText = text.replace(/\n$/, '');
   }
 
-  function renderUnifiedWord(ops) {
-    var html = '';
-    for (var k = 0; k < ops.length; k++) {
-      var op = ops[k];
-      var text = WUS.escapeHtml(op.value);
-      if (op.type === 'add') html += '<span class="tok-add">' + text + '</span>';
-      else if (op.type === 'del') html += '<span class="tok-del">' + text + '</span>';
-      else html += text;
+  function sideRow(kind, num, html) {
+    if (kind === 'empty') {
+      return '<span class="side-row --empty"><span class="side-num">&nbsp;</span><span class="side-text">&nbsp;</span></span>';
     }
-    return html;
+    var cls = kind === 'del' ? ' --del' : kind === 'add' ? ' --add' : '';
+    return '<span class="side-row' + cls + '"><span class="side-num">' + num + '</span><span class="side-text">' + (html || '&nbsp;') + '</span></span>';
   }
 
-  function renderSideLine(ops) {
+  function renderSideBySide(rows) {
     var htmlA = '', htmlB = '';
-    for (var k = 0; k < ops.length; k++) {
-      var op = ops[k];
-      if (op.type === 'equal') {
-        var t = WUS.escapeHtml(op.value) || '&nbsp;';
-        htmlA += '<span class="side-row">' + t + '</span>\n';
-        htmlB += '<span class="side-row">' + t + '</span>\n';
-      } else if (op.type === 'del') {
-        htmlA += '<span class="side-row --del">' + (WUS.escapeHtml(op.value) || '&nbsp;') + '</span>\n';
-        htmlB += '<span class="side-row --empty">&nbsp;</span>\n';
-      } else {
-        htmlA += '<span class="side-row --empty">&nbsp;</span>\n';
-        htmlB += '<span class="side-row --add">' + (WUS.escapeHtml(op.value) || '&nbsp;') + '</span>\n';
+    rows.forEach(function (row) {
+      if (row.type === 'equal') {
+        var eHtml = WUS.escapeHtml(row.a);
+        htmlA += sideRow('equal', row.ai + 1, eHtml);
+        htmlB += sideRow('equal', row.bi + 1, eHtml);
+      } else if (row.type === 'del') {
+        htmlA += sideRow('del', row.ai + 1, WUS.escapeHtml(row.a));
+        htmlB += sideRow('empty');
+      } else if (row.type === 'add') {
+        htmlA += sideRow('empty');
+        htmlB += sideRow('add', row.bi + 1, WUS.escapeHtml(row.b));
+      } else { /* changed */
+        if (granularity === 'word') {
+          var wd = wordDiffHtml(row.a, row.b);
+          htmlA += sideRow('del', row.ai + 1, wd.aHtml);
+          htmlB += sideRow('add', row.bi + 1, wd.bHtml);
+        } else {
+          htmlA += sideRow('del', row.ai + 1, WUS.escapeHtml(row.a));
+          htmlB += sideRow('add', row.bi + 1, WUS.escapeHtml(row.b));
+        }
       }
-    }
-    return { a: htmlA, b: htmlB };
+    });
+    diffSideA.innerHTML = htmlA;
+    diffSideB.innerHTML = htmlB;
   }
 
-  function renderSideWord(ops) {
-    var htmlA = '', htmlB = '';
-    for (var k = 0; k < ops.length; k++) {
-      var op = ops[k];
-      var text = WUS.escapeHtml(op.value);
-      if (op.type === 'equal') { htmlA += text; htmlB += text; }
-      else if (op.type === 'del') { htmlA += '<span class="tok-del">' + text + '</span>'; }
-      else { htmlB += '<span class="tok-add">' + text + '</span>'; }
-    }
-    return { a: htmlA, b: htmlB };
+  function renderSummary(counts) {
+    statAdded.textContent = counts.added.toLocaleString();
+    statRemoved.textContent = counts.removed.toLocaleString();
+    statChanged.textContent = counts.changed.toLocaleString();
+    statUnchanged.textContent = counts.unchanged.toLocaleString();
+    summaryBar.hidden = false;
   }
 
-  function buildPlainDiffText(ops, m) {
-    var merged = m === 'word' ? mergeConsecutive(ops) : ops;
-    return merged.map(function (o) {
-      var prefix = o.type === 'add' ? '+ ' : o.type === 'del' ? '- ' : '  ';
-      return prefix + o.value;
-    }).join('\n');
-  }
-
-  /* =================================================================
-     SUMMARY
-     ================================================================= */
-  function hasContent(v) { return /\S/.test(v); }
-
-  function computeSummary(ops) {
-    var added = 0, removed = 0, unchanged = 0, changed = 0;
-    var k = 0;
-    while (k < ops.length) {
-      var op = ops[k];
-      if (op.type === 'equal') {
-        if (hasContent(op.value)) unchanged++;
-        k++;
-        continue;
-      }
-      // Collect a hunk of consecutive add/del ops and pair them up as "changed".
-      var dels = 0, adds = 0;
-      while (k < ops.length && ops[k].type !== 'equal') {
-        if (ops[k].type === 'del') { if (hasContent(ops[k].value)) dels++; }
-        else { if (hasContent(ops[k].value)) adds++; }
-        k++;
-      }
-      var pair = Math.min(dels, adds);
-      changed += pair;
-      removed += dels - pair;
-      added += adds - pair;
-    }
-    return { added: added, removed: removed, unchanged: unchanged, changed: changed };
-  }
-
-  /* =================================================================
-     CORE — run diff + render current view
-     ================================================================= */
-  function updateInputMeta() {
-    statsA.textContent = inputA.value.length.toLocaleString() + (inputA.value.length === 1 ? ' char' : ' chars');
-    statsB.textContent = inputB.value.length.toLocaleString() + (inputB.value.length === 1 ? ' char' : ' chars');
-  }
-
-  function setStatus(cls, text) {
+  function updateStatusBadge(aText, bText, counts) {
     statusBadge.classList.remove('has-changes', 'is-same');
-    if (cls) statusBadge.classList.add(cls);
-    statusText.textContent = text;
+    if (aText === bText) {
+      statusBadge.classList.add('is-same');
+      statusText.textContent = 'Identical';
+    } else {
+      var total = counts.added + counts.removed + counts.changed;
+      statusBadge.classList.add('has-changes');
+      statusText.textContent = total.toLocaleString() + (total === 1 ? ' change' : ' changes');
+    }
+  }
+
+  function updateViewVisibility() {
+    var showSide = view === 'side';
+    diffSide.hidden = !showSide;
+    diffSide.classList.toggle('is-active', showSide);
+    diffUnified.hidden = showSide;
+  }
+
+  function updateInputMeta() {
+    var la = inputA.value.length, lb = inputB.value.length;
+    statsA.textContent = la.toLocaleString() + (la === 1 ? ' char' : ' chars');
+    statsB.textContent = lb.toLocaleString() + (lb === 1 ? ' char' : ' chars');
   }
 
   function showEmpty() {
     emptyState.hidden = false;
     tooLarge.hidden = true;
     diffUnified.hidden = true;
+    diffSide.hidden = true;
     diffSide.classList.remove('is-active');
-    diffMeta.textContent = '';
     summaryBar.hidden = true;
-    setStatus('', 'Ready');
+    diffMeta.textContent = '';
+    lastUnifiedText = '';
+    statusBadge.classList.remove('has-changes', 'is-same');
+    statusText.textContent = 'Ready';
   }
 
   function showTooLarge() {
-    emptyState.hidden = true;
     tooLarge.hidden = false;
+    emptyState.hidden = true;
     diffUnified.hidden = true;
+    diffSide.hidden = true;
     diffSide.classList.remove('is-active');
-    diffMeta.textContent = '';
     summaryBar.hidden = true;
-    setStatus('', 'Too large');
+    diffMeta.textContent = 'Input too large for a live diff';
+    lastUnifiedText = '';
+    statusBadge.classList.remove('has-changes', 'is-same');
+    statusText.textContent = 'Too large';
   }
 
-  function renderCurrentView() {
-    if (lastTooLarge) { showTooLarge(); return; }
-    if (!lastOps) { showEmpty(); return; }
+  /* =================================================================
+     MAIN RENDER PASS
+     ================================================================= */
+  function renderDiff() {
+    updateInputMeta();
+
+    var aText = inputA.value;
+    var bText = inputB.value;
+
+    if (!aText && !bText) { showEmpty(); return; }
+
+    var aLines = aText === '' ? [] : aText.split('\n');
+    var bLines = bText === '' ? [] : bText.split('\n');
+
+    var ops = computeLCSOps(aLines, bLines, LINE_CAP);
+    if (!ops) { showTooLarge(); return; }
+
+    var rows = buildRows(ops);
+    var counts = countRows(rows);
 
     emptyState.hidden = true;
     tooLarge.hidden = true;
 
-    if (view === 'unified') {
-      diffUnified.hidden = false;
-      diffSide.classList.remove('is-active');
-      diffUnified.innerHTML = mode === 'word' ? renderUnifiedWord(lastOps) : renderUnifiedLine(lastOps);
-    } else {
-      diffUnified.hidden = true;
-      diffSide.classList.add('is-active');
-      var sides = mode === 'word' ? renderSideWord(lastOps) : renderSideLine(lastOps);
-      diffSideA.innerHTML = sides.a;
-      diffSideB.innerHTML = sides.b;
-    }
+    renderUnified(rows);
+    renderSideBySide(rows);
+    updateViewVisibility();
+    renderSummary(counts);
+    updateStatusBadge(aText, bText, counts);
 
-    var s = computeSummary(lastOps);
-    statAdded.textContent = String(s.added);
-    statRemoved.textContent = String(s.removed);
-    statChanged.textContent = String(s.changed);
-    statUnchanged.textContent = String(s.unchanged);
-    summaryBar.hidden = false;
-
-    var total = s.added + s.removed + s.changed;
-    if (total === 0) setStatus('is-same', 'Identical');
-    else setStatus('has-changes', total + ' change' + (total === 1 ? '' : 's'));
-
-    var aTokens = tokenize(inputA.value, mode).filter(hasContent).length;
-    var bTokens = tokenize(inputB.value, mode).filter(hasContent).length;
-    diffMeta.textContent = aTokens + ' → ' + bTokens + (mode === 'word' ? ' words' : ' lines');
+    diffMeta.textContent = rows.length.toLocaleString() + ' rows · ' +
+      (granularity === 'word' ? 'Word' : 'Line') + ' mode · ' +
+      (view === 'side' ? 'Side-by-side' : 'Unified') + ' view';
   }
-
-  function runDiff() {
-    var a = inputA.value, b = inputB.value;
-    if (a === '' && b === '') {
-      lastOps = null;
-      lastTooLarge = false;
-      renderCurrentView();
-      persistDebounced();
-      return;
-    }
-    var ta = tokenize(a, mode);
-    var tb = tokenize(b, mode);
-    var ops = diffArrays(ta, tb);
-    if (ops === null) {
-      lastOps = null;
-      lastTooLarge = true;
-    } else {
-      lastOps = ops;
-      lastTooLarge = false;
-    }
-    renderCurrentView();
-    persistDebounced();
-  }
+  var renderDebounced = WUS.debounce(renderDiff, 250);
 
   /* =================================================================
-     ACTIONS
+     ACTIONS — copy / download / swap / clear / sample
      ================================================================= */
   function copyDiff() {
-    if (!lastOps || lastTooLarge) { WUS.toast('Nothing to copy yet', 'error'); return; }
-    WUS.copy(buildPlainDiffText(lastOps, mode), 'Diff copied to clipboard');
+    if (!lastUnifiedText) { WUS.toast('Nothing to copy yet', 'error'); return; }
+    WUS.copy(lastUnifiedText, 'Diff copied to clipboard');
   }
 
   function downloadDiff() {
-    if (!lastOps || lastTooLarge) { WUS.toast('Nothing to download yet', 'error'); return; }
-    var content = buildPlainDiffText(lastOps, mode);
+    if (!lastUnifiedText) { WUS.toast('Nothing to download yet', 'error'); return; }
     var name = 'diff-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.diff';
-    WUS.download(name, content, 'text/plain;charset=utf-8');
+    WUS.download(name, lastUnifiedText + '\n', 'text/plain;charset=utf-8');
     WUS.toast('Downloaded ' + name);
-  }
-
-  var SAMPLE_A = 'The quick brown fox jumps over the lazy dog.\nWeb Utility Suite ships free, offline developer tools.\nNo build step, no frameworks, no tracking.\nThis line will be removed in the sample.\nContact: hello@example.com';
-  var SAMPLE_B = 'The quick brown fox leaps over the lazy dog.\nWeb Utility Suite ships free, offline developer tools.\nNo build step, no frameworks, ever.\nThis line was added in the sample.\nContact: support@example.com';
-
-  function loadSample() {
-    inputA.value = SAMPLE_A;
-    inputB.value = SAMPLE_B;
-    updateInputMeta();
-    runDiff();
-    WUS.toast('Sample loaded');
-  }
-
-  function clearAll() {
-    inputA.value = '';
-    inputB.value = '';
-    updateInputMeta();
-    lastOps = null;
-    lastTooLarge = false;
-    renderCurrentView();
-    WUS.store.remove(STORE_KEY);
-    inputA.focus();
   }
 
   function swapInputs() {
     var tmp = inputA.value;
     inputA.value = inputB.value;
     inputB.value = tmp;
-    updateInputMeta();
-    runDiff();
+    renderDiff();
+    persist();
     WUS.toast('Swapped Text A and Text B');
   }
 
-  /* -------------------------- Mode / view toggles --------------------------- */
-  function setMode(next) {
-    if (mode === next) return;
-    mode = next;
-    modeLineBtn.classList.toggle('is-active', mode === 'line');
-    modeLineBtn.setAttribute('aria-selected', String(mode === 'line'));
-    modeWordBtn.classList.toggle('is-active', mode === 'word');
-    modeWordBtn.setAttribute('aria-selected', String(mode === 'word'));
-    runDiff();
+  function clearAll() {
+    inputA.value = '';
+    inputB.value = '';
+    showEmpty();
+    updateInputMeta();
+    WUS.store.remove(STORE_KEY);
+    inputA.focus();
   }
-  function setView(next) {
-    if (view === next) return;
-    view = next;
-    viewUnifiedBtn.classList.toggle('is-active', view === 'unified');
-    viewUnifiedBtn.setAttribute('aria-selected', String(view === 'unified'));
-    viewSideBtn.classList.toggle('is-active', view === 'side');
-    viewSideBtn.setAttribute('aria-selected', String(view === 'side'));
-    renderCurrentView();
+
+  var SAMPLE_A =
+    'Web Utility Suite\n' +
+    'A collection of fast, offline developer tools.\n' +
+    'Built with vanilla JavaScript — no frameworks, no build step.\n' +
+    'Every tool runs entirely in your browser.\n' +
+    'Dark and light themes are supported.\n' +
+    'MIT Licensed.\n';
+  var SAMPLE_B =
+    'Web Utility Suite\n' +
+    'A collection of fast, private, offline developer tools.\n' +
+    'Built with vanilla JavaScript — zero dependencies, no build step.\n' +
+    'Every tool runs entirely in your browser, with nothing sent to a server.\n' +
+    'Dark and light themes are supported out of the box.\n' +
+    'MIT Licensed.\n' +
+    'Part of the kasapdev suite.\n';
+
+  function loadSample() {
+    inputA.value = SAMPLE_A;
+    inputB.value = SAMPLE_B;
+    renderDiff();
     persist();
+    WUS.toast('Sample loaded');
   }
 
   /* =================================================================
-     PERSISTENCE
+     MODE / VIEW TOGGLES (segmented controls)
+     ================================================================= */
+  function setGranularity(next) {
+    granularity = next;
+    modeLineBtn.classList.toggle('is-active', next === 'line');
+    modeLineBtn.setAttribute('aria-selected', String(next === 'line'));
+    modeWordBtn.classList.toggle('is-active', next === 'word');
+    modeWordBtn.setAttribute('aria-selected', String(next === 'word'));
+    renderDiff();
+    persist();
+  }
+
+  function setView(next) {
+    view = next;
+    viewUnifiedBtn.classList.toggle('is-active', next === 'unified');
+    viewUnifiedBtn.setAttribute('aria-selected', String(next === 'unified'));
+    viewSideBtn.classList.toggle('is-active', next === 'side');
+    viewSideBtn.setAttribute('aria-selected', String(next === 'side'));
+    updateViewVisibility();
+    if (diffMeta.textContent) {
+      diffMeta.textContent = diffMeta.textContent.replace(/(Unified|Side-by-side) view$/, (next === 'side' ? 'Side-by-side' : 'Unified') + ' view');
+    }
+    persist();
+  }
+
+  modeLineBtn.addEventListener('click', function () { setGranularity('line'); });
+  modeWordBtn.addEventListener('click', function () { setGranularity('word'); });
+  viewUnifiedBtn.addEventListener('click', function () { setView('unified'); });
+  viewSideBtn.addEventListener('click', function () { setView('side'); });
+
+  /* =================================================================
+     PERSISTENCE — debounced save of both texts + settings, restore
      ================================================================= */
   function persist() {
-    WUS.store.set(STORE_KEY, { a: inputA.value, b: inputB.value, mode: mode, view: view });
+    WUS.store.set(STORE_KEY, {
+      a: inputA.value,
+      b: inputB.value,
+      granularity: granularity,
+      view: view
+    });
   }
   var persistDebounced = WUS.debounce(persist, 400);
 
@@ -381,30 +465,21 @@
     if (!saved) return;
     if (typeof saved.a === 'string') inputA.value = saved.a;
     if (typeof saved.b === 'string') inputB.value = saved.b;
-    if (saved.mode === 'word' || saved.mode === 'line') mode = saved.mode;
-    if (saved.view === 'unified' || saved.view === 'side') view = saved.view;
-    modeLineBtn.classList.toggle('is-active', mode === 'line');
-    modeLineBtn.setAttribute('aria-selected', String(mode === 'line'));
-    modeWordBtn.classList.toggle('is-active', mode === 'word');
-    modeWordBtn.setAttribute('aria-selected', String(mode === 'word'));
-    viewUnifiedBtn.classList.toggle('is-active', view === 'unified');
-    viewUnifiedBtn.setAttribute('aria-selected', String(view === 'unified'));
-    viewSideBtn.classList.toggle('is-active', view === 'side');
-    viewSideBtn.setAttribute('aria-selected', String(view === 'side'));
-    updateInputMeta();
-    runDiff();
+    if (saved.granularity === 'word') setGranularity('word'); else setGranularity('line');
+    if (saved.view === 'side') setView('side'); else setView('unified');
   }
 
   /* =================================================================
      SHORTCUTS HELP MODAL
      ================================================================= */
   var helpBackdrop = document.getElementById('helpBackdrop');
-  var helpClose = document.getElementById('helpClose');
+  var helpClose    = document.getElementById('helpClose');
   var shortcutRows = document.getElementById('shortcutRows');
 
   var SHORTCUTS = [
+    { keys: ['mod', '⏎'], desc: 'Re-diff now' },
     { keys: ['mod', 'S'], desc: 'Download diff' },
-    { keys: ['mod', '⏎'], desc: 'Copy diff' },
+    { keys: ['mod', 'Shift', 'X'], desc: 'Swap Text A / Text B' },
     { keys: ['?'], desc: 'Show this help' },
     { keys: ['Esc'], desc: 'Close dialog' }
   ];
@@ -422,42 +497,42 @@
   function closeHelp() { helpBackdrop.hidden = true; }
 
   helpClose.addEventListener('click', closeHelp);
-  helpBackdrop.addEventListener('click', function (e) { if (e.target === helpBackdrop) closeHelp(); });
+  helpBackdrop.addEventListener('click', function (e) {
+    if (e.target === helpBackdrop) closeHelp();
+  });
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && !helpBackdrop.hidden) closeHelp();
   });
+
   var helpBtns = document.querySelectorAll('[data-shortcut-help]');
-  for (var hi = 0; hi < helpBtns.length; hi++) helpBtns[hi].addEventListener('click', openHelp);
+  for (var i = 0; i < helpBtns.length; i++) helpBtns[i].addEventListener('click', openHelp);
 
   /* =================================================================
      WIRING
      ================================================================= */
-  document.getElementById('btnSwap').addEventListener('click', swapInputs);
-  document.getElementById('btnCopy').addEventListener('click', copyDiff);
-  document.getElementById('btnDownload').addEventListener('click', downloadDiff);
-  document.getElementById('btnSample').addEventListener('click', loadSample);
-  document.getElementById('btnSampleEmpty').addEventListener('click', loadSample);
-  document.getElementById('btnClear').addEventListener('click', clearAll);
+  btnSwap.addEventListener('click', swapInputs);
+  btnCopy.addEventListener('click', copyDiff);
+  btnDownload.addEventListener('click', downloadDiff);
+  btnSample.addEventListener('click', loadSample);
+  btnClear.addEventListener('click', clearAll);
+  btnSampleEmpty.addEventListener('click', loadSample);
 
-  modeLineBtn.addEventListener('click', function () { setMode('line'); });
-  modeWordBtn.addEventListener('click', function () { setMode('word'); });
-  viewUnifiedBtn.addEventListener('click', function () { setView('unified'); });
-  viewSideBtn.addEventListener('click', function () { setView('side'); });
+  inputA.addEventListener('input', function () { renderDebounced(); persistDebounced(); });
+  inputB.addEventListener('input', function () { renderDebounced(); persistDebounced(); });
 
-  var runDiffDebounced = WUS.debounce(runDiff, 300);
-  inputA.addEventListener('input', function () { updateInputMeta(); runDiffDebounced(); });
-  inputB.addEventListener('input', function () { updateInputMeta(); runDiffDebounced(); });
-
-  document.addEventListener('keydown', function (e) {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); copyDiff(); }
-  });
-
+  /* Global keyboard shortcuts via WUS. mod+enter fires even while a
+     textarea is focused (core.js only suppresses bare, non-mod keys
+     while typing), so a single registration covers both cases. */
+  WUS.registerShortcut('mod+enter', function () { renderDiff(); WUS.toast('Diff refreshed'); }, 'Re-diff now');
   WUS.registerShortcut('mod+s', function () { downloadDiff(); }, 'Download diff');
+  WUS.registerShortcut('mod+shift+x', function () { swapInputs(); }, 'Swap Text A / Text B');
   WUS.registerShortcut('?', function () { openHelp(); }, 'Show shortcuts');
 
   /* =================================================================
      INIT
      ================================================================= */
   buildShortcutTable();
+  updateInputMeta();
   restore();
+  renderDiff();
 })();
