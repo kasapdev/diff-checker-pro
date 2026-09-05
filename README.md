@@ -1,6 +1,6 @@
 # Diff Checker Pro
 
-[![CI](https://github.com/kasapdev/diff-checker-pro/actions/workflows/ci.yml/badge.svg)](https://github.com/kasapdev/diff-checker-pro/actions/workflows/ci.yml)
+[![CI](https://github.com/kasapdev/diff-checker-pro/actions/workflows/ci.yml/badge.svg)](https://github.com/kasapdev/diff-checker-pro/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Vanilla JS](https://img.shields.io/badge/Vanilla-JS-F7DF1E?logo=javascript&logoColor=black)
 
 Compare two texts line-by-line or word-by-word, with side-by-side and unified views — fast, private, and fully offline.
 
